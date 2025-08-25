@@ -1,0 +1,15 @@
+[Unit]
+Description=Pionex CE+ADX Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/pionex-bot
+EnvironmentFile=/home/ubuntu/pionex-bot/.env
+ExecStart=/home/ubuntu/pionex-bot/.venv/bin/python /home/ubuntu/pionex-bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
