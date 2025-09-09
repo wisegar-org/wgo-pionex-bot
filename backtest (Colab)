@@ -1,0 +1,585 @@
+# ============================================================
+# BACKTEST ÚNICO (Colab) • CE+ADX + IA Patrones + Walk-Forward
+# - Mercado: BTC_USDT_PERP (Pionex) • TF=15m • 2023→HOY
+# - Estrategia: CE(22,2.0) + ADX(14)>35, trailing CE, SL=1.5*ATR, TP=2.5*ATR
+# - Realismo: taker=0.05%, slippage stop=12 bps, min notional=11 USDT, redondeo tamaño=4 dec.
+#             apalancamiento 3x, tope por liquidez (1% del $vol EMA)
+# - Riesgo: ~2% por operación (dimensionado por distancia al SL)
+# - IA: ventana 64 velas (log-retornos, RSI, ADX), K-means(K=20), Beta(8,8), umbral según TP/SL (+0.03)
+# - Walk-Forward: reentrena cada 96 velas (≈1 día) con 180 días de histórico OOS
+# - Salida: CSVs (bt_* y wf_*), gráfico equity y drawdown
+# ============================================================
+
+import time, math, numpy as np, pandas as pd, requests, matplotlib.pyplot as plt
+from math import floor
+
+np.random.seed(42)
+
+# --------- SWITCHES (puedes activar/desactivar) ----------
+RUN_BACKTEST     = True
+RUN_WALKFORWARD  = True
+
+# --------- CONFIG BÁSICA ----------
+SYMBOL = "BTC_USDT_PERP"
+TIMEFRAME = "15m"
+START = "2023-01-01"
+END = "now"  # o "2025-09-05", etc (UTC)
+
+INITIAL_CASH = 34.66
+
+# Señal base
+CE_LENGTH=22; CE_MULT=2.0
+ADX_LENGTH=14; ADX_THRESHOLD=35.0
+USE_EMA_FILTER=False; EMA_LENGTH=200
+ALLOW_SHORTS=True
+SL_ATR=1.5; TP_ATR=2.5
+COOLDOWN_BARS=3
+
+# Realismo / límites
+TAKER_FEE=0.0005
+MIN_NOTIONAL=11.0
+LIQ_FRAC=0.01
+LEVERAGE=3.0
+ATR_FLOOR_PCT=0.002
+STOP_SLIP_BPS=12.0  # slippage extra cuando el stop salta (en bps)
+
+# Riesgo
+PERCENT_RISK_ATR=0.02
+
+# IA de patrones
+USE_PATTERN_AI=True
+PAT_WIN_LEN=64; PAT_K=20; PAT_ITERS=50; PAT_MAX_TRAIN_SAMPLES=4000
+PAT_MIN_COUNT=100; PAT_ALPHA=8.0; PAT_BETA=8.0; PAT_AI_PMIN_OFFSET=0.03  # +3% sobre el umbral teórico
+
+# Walk-Forward
+LOOKBACK_DAYS=180
+RETRAIN_EVERY_BARS=96  # 96 velas ≈ 1 día en 15m
+
+# ---------- Utilidades ----------
+def zscore(x, eps=1e-9):
+    x = np.asarray(x, dtype=float); mu=x.mean(); sd=x.std()
+    if sd < eps: sd = 1.0
+    return (x - mu)/sd
+
+TF_MAP = {
+    "1m":("1M",60000), "5m":("5M",300000), "15m":("15M",900000),
+    "30m":("30M",1800000), "1h":("60M",3600000),
+    "4h":("4H",14400000), "8h":("8H",28800000), "12h":("12H",43200000),
+    "1d":("1D",86400000)
+}
+
+def fetch_df(symbol, timeframe, start=None, end=None):
+    if timeframe not in TF_MAP: raise ValueError("TF no soportado")
+    tf_code, tf_ms = TF_MAP[timeframe]
+    start_ms = int(pd.Timestamp(start, tz='UTC').timestamp()*1000) if start else None
+    end_ms   = int(pd.Timestamp.utcnow().timestamp()*1000) if (end is None or end=="now") \
+               else int(pd.Timestamp(end, tz='UTC').timestamp()*1000)
+    rows=[]; end_cursor=end_ms; last_oldest=None
+    base="https://api.pionex.com/api/v1/market/klines"
+    while True:
+        params={"symbol":symbol,"interval":tf_code,"limit":500,"endTime":end_cursor}
+        r=requests.get(base, params=params, timeout=30); r.raise_for_status()
+        data=r.json()
+        if not data.get("result", False): break
+        kl = data["data"].get("klines", [])
+        if not kl: break
+        kl.sort(key=lambda x:x["time"])
+        rows.extend(kl)
+        oldest = kl[0]["time"]
+        if last_oldest is not None and oldest>=last_oldest: break
+        last_oldest=oldest
+        if start_ms is not None and oldest<=start_ms: break
+        end_cursor = oldest - tf_ms
+        if end_cursor<0: break
+        time.sleep(0.12)
+    if not rows: return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    for col in ["open","high","low","close","volume"]:
+        df[col]=pd.to_numeric(df[col], errors='coerce')
+    df["time"]=pd.to_datetime(df["time"], unit="ms", utc=True)
+    df=df.dropna(subset=["open","high","low","close"]).drop_duplicates("time").set_index("time").sort_index()
+    if start_ms is not None: df = df[df.index >= pd.to_datetime(start_ms, unit="ms", utc=True)]
+    if end_ms   is not None: df = df[df.index <= pd.to_datetime(end_ms,   unit="ms", utc=True)]
+    return df
+
+# ---------- Indicadores ----------
+def rma(x, n): return x.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+def true_range(h,l,c):
+    pc = c.shift(1)
+    return pd.concat([(h-l).abs(), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
+def atr(h,l,c,n): return rma(true_range(h,l,c), n)
+def dmi_adx(h,l,c,n):
+    up = h.diff(); dn = (-l.diff())
+    plus_dm  = pd.Series(np.where((up>dn)&(up>0), up, 0.0), index=h.index)
+    minus_dm = pd.Series(np.where((dn>up)&(dn>0), dn, 0.0), index=h.index)
+    a = atr(h,l,c,n)
+    plus_di  = 100 * rma(plus_dm,  n) / (a+1e-12)
+    minus_di = 100 * rma(minus_dm, n) / (a+1e-12)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-12)
+    adx = rma(dx, n)
+    return plus_di.fillna(0), minus_di.fillna(0), adx.fillna(0)
+def chandelier_exit(h,l,c,length,mult):
+    a = atr(h,l,c,length)
+    hh = h.rolling(length, min_periods=length).max()
+    ll = l.rolling(length, min_periods=length).min()
+    ceL = hh - a*mult
+    ceS = ll + a*mult
+    return ceL, ceS, a
+def ema(s, n): return s.ewm(span=n, adjust=False, min_periods=n).mean()
+def rsi(series, n=14):
+    delta = series.diff()
+    up = delta.clip(lower=0.0); down = -delta.clip(upper=0.0)
+    roll_up = up.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    roll_down = down.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    return 100 - (100/(1+rs))
+
+# ---------- IA (K-means minimal, sin sklearn) ----------
+def build_pattern_vector(idx:int, side:str, L:int, close:pd.Series, rsi_s:pd.Series, adx_s:pd.Series):
+    if idx - L + 1 < 0: return None
+    sl = slice(idx - L + 1, idx + 1)
+    c = close.iloc[sl].values
+    rsi_win = rsi_s.iloc[sl].values
+    adx_win = adx_s.iloc[sl].values
+    lr = np.diff(np.log(np.maximum(c, 1e-9)))
+    lr = np.concatenate(([0.0], lr))
+    if side == "short": lr = -lr
+    lr  = zscore(lr); rsi_v = zscore(rsi_win); adx_v = zscore(adx_win)
+    return np.concatenate([lr, rsi_v, adx_v], axis=0).astype(np.float32)
+
+def kmeans_fit(X:np.ndarray, k:int, iters:int=50, seed:int=42):
+    rng = np.random.default_rng(seed)
+    n, d = X.shape
+    idx = rng.choice(n, size=min(k, n), replace=False)
+    C = X[idx].copy()
+    if C.shape[0] < k:
+        reps = rng.choice(C.shape[0], size=k - C.shape[0], replace=True)
+        C = np.vstack([C, C[reps]])
+    assign = np.zeros(n, dtype=np.int32)
+    for _ in range(iters):
+        d2 = np.sum((X[:,None,:] - C[None,:,:])**2, axis=2)
+        new_assign = np.argmin(d2, axis=1)
+        if np.array_equal(new_assign, assign) and _>0: break
+        assign = new_assign
+        for j in range(k):
+            mask = (assign==j)
+            C[j] = X[rng.integers(0,n)] if not np.any(mask) else X[mask].mean(axis=0)
+    return C, assign
+
+def train_pattern_ai(df, ceL, ceS, adx_s, rsi_s, ema_s, atr_raw,
+                     L, K, max_samples=4000, adx_thr=35.0, use_ema=False, allow_shorts=True):
+    close = df["close"]
+    Xv=[]; y=[]
+    for j in range(1,len(df)):
+        pc = float(df["close"].iloc[j-1]); c = float(df["close"].iloc[j])
+        ceL_now, ceS_now = float(ceL.iloc[j]), float(ceS.iloc[j])
+        ceL_prev, ceS_prev = float(ceL.iloc[j-1]), float(ceS.iloc[j-1])
+        adx_now = float(adx_s.iloc[j])
+        ema_ok_L = True if not use_ema else (c > float(ema_s.iloc[j]))
+        ema_ok_S = True if not use_ema else (c < float(ema_s.iloc[j]))
+        long_sig  = (pc <= ceS_prev) and (c > ceS_now) and (adx_now > adx_thr) and ema_ok_L
+        short_sig = (pc >= ceL_prev) and (c < ceL_now) and (adx_now > adx_thr) and ema_ok_S and allow_shorts
+        side = "long" if long_sig else ("short" if short_sig else None)
+        if side is None: continue
+        if j - L + 1 < 0: continue
+        vec = build_pattern_vector(j, side, L, close, rsi_s, adx_s)
+        if vec is None: continue
+
+        # Etiqueta por TP/SL (máx 96 velas)
+        entry = c; atr_j = float(atr_raw.iloc[j])
+        if atr_j<=0: continue
+        lab=None
+        if side=="long":
+            tp = entry + TP_ATR*atr_j; sl = entry - SL_ATR*atr_j
+            for k in range(j+1, min(j+97, len(df))):
+                h=float(df["high"].iloc[k]); l=float(df["low"].iloc[k])
+                if l<=sl: lab=0; break
+                if h>=tp: lab=1; break
+        else:
+            tp = entry - TP_ATR*atr_j; sl = entry + SL_ATR*atr_j
+            for k in range(j+1, min(j+97, len(df))):
+                h=float(df["high"].iloc[k]); l=float(df["low"].iloc[k])
+                if h>=sl: lab=0; break
+                if l<=tp: lab=1; break
+        if lab is None: continue
+        Xv.append(vec); y.append(lab)
+
+    if not Xv: return None
+    X = np.vstack(Xv).astype(np.float32); y = np.asarray(y, dtype=np.float32)
+    if len(X) > max_samples:
+        sel = np.random.choice(len(X), size=max_samples, replace=False)
+        X = X[sel]; y = y[sel]
+    K = min(K, len(X)) if len(X)>0 else 1
+    centers, assign = kmeans_fit(X, K, iters=PAT_ITERS, seed=42)
+    wr = np.zeros(centers.shape[0], dtype=np.float32)
+    cnt = np.zeros(centers.shape[0], dtype=np.int32)
+    for k in range(centers.shape[0]):
+        mask = (assign==k)
+        cnt[k] = int(mask.sum())
+        wins_k = float(y[mask].sum()) if cnt[k]>0 else 0.0
+        wr[k]  = (wins_k + PAT_ALPHA) / (cnt[k] + PAT_ALPHA + PAT_BETA)
+    return {"centers":centers, "wr":wr, "counts":cnt, "L":PAT_WIN_LEN}
+
+# ---------- Backtest ----------
+def backtest(df:pd.DataFrame, use_pattern_ai=True):
+    ceL, ceS, atr_raw = chandelier_exit(df["high"], df["low"], df["close"], CE_LENGTH, CE_MULT)
+    _ , _, adx = dmi_adx(df["high"], df["low"], df["close"], ADX_LENGTH)
+    ema_line = ema(df["close"], EMA_LENGTH) if USE_EMA_FILTER else pd.Series(np.nan, index=df.index)
+    rs_series = rsi(df["close"], 14)
+    dollar_vol_ema = (df["close"]*df["volume"]).ewm(span=20, adjust=False, min_periods=1).mean().fillna(0.0)
+    atr_eff = pd.Series(np.maximum(atr_raw.values, ATR_FLOOR_PCT * df["close"].values), index=df.index)
+
+    pattern_model = None
+    if use_pattern_ai and USE_PATTERN_AI:
+        pattern_model = train_pattern_ai(df, ceL, ceS, adx, rs_series, ema_line, atr_raw,
+                                         L=PAT_WIN_LEN, K=PAT_K, max_samples=PAT_MAX_TRAIN_SAMPLES,
+                                         adx_thr=ADX_THRESHOLD, use_ema=USE_EMA_FILTER, allow_shorts=ALLOW_SHORTS)
+
+    cash = float(INITIAL_CASH); pos_size=0.0; pos_side=None; entry_price=np.nan
+    trail_ce=np.nan; trades=[]; equity_curve=[]; cooldown=0
+
+    for i in range(1,len(df)):
+        ts = df.index[i]
+        o,h,l,c = [float(df[col].iloc[i]) for col in ["open","high","low","close"]]
+        pc = float(df["close"].iloc[i-1])
+        ceL_now, ceS_now = float(ceL.iloc[i]), float(ceS.iloc[i])
+        ceL_prev, ceS_prev = float(ceL.iloc[i-1]), float(ceS.iloc[i-1])
+        adx_now = float(adx.iloc[i])
+        ema_ok_L = True if not USE_EMA_FILTER else (c > float(ema_line.iloc[i]))
+        ema_ok_S = True if not USE_EMA_FILTER else (c < float(ema_line.iloc[i]))
+        long_sig  = (pc <= ceS_prev) and (c > ceS_now) and (adx_now > ADX_THRESHOLD) and ema_ok_L
+        short_sig = (pc >= ceL_prev) and (c < ceL_now) and (adx_now > ADX_THRESHOLD) and ema_ok_S and ALLOW_SHORTS
+        if cooldown>0: long_sig=False; short_sig=False; cooldown-=1
+        atr_i = float(atr_eff.iloc[i])
+
+        # Trailing & niveles
+        if pos_side=="long" and pos_size>0:
+            trail_ce = ceL_now if not np.isfinite(trail_ce) else max(trail_ce, ceL_now)
+            stop_lvl = max(trail_ce, entry_price - SL_ATR*atr_i)
+            tp_lvl   = entry_price + TP_ATR*atr_i if TP_ATR>0 else None
+        elif pos_side=="short" and pos_size>0:
+            trail_ce = ceS_now if not np.isfinite(trail_ce) else min(trail_ce, ceS_now)
+            stop_lvl = min(trail_ce, entry_price + SL_ATR*atr_i)
+            tp_lvl   = entry_price - TP_ATR*atr_i if TP_ATR>0 else None
+        else:
+            stop_lvl=None; tp_lvl=None
+
+        # Salidas intrabar
+        if pos_side is not None and pos_size>0:
+            exit_px=None
+            if pos_side=="long":
+                if l <= stop_lvl: exit_px = stop_lvl*(1 - STOP_SLIP_BPS*1e-4)
+                elif tp_lvl is not None and h >= tp_lvl: exit_px = tp_lvl
+            else:
+                if h >= stop_lvl: exit_px = stop_lvl*(1 + STOP_SLIP_BPS*1e-4)
+                elif tp_lvl is not None and l <= tp_lvl: exit_px = tp_lvl
+
+            if exit_px is not None:
+                fee = TAKER_FEE * abs(pos_size*exit_px)
+                if pos_side=="long":  cash += pos_size*exit_px - fee
+                else:                  cash -= pos_size*exit_px + fee
+                trades[-1]["exit_t"]=ts; trades[-1]["exit"]=float(exit_px)
+                pnl = pos_size*((exit_px - entry_price) if pos_side=="long" else (entry_price - exit_px)) - fee - trades[-1]["pnl"]
+                trades[-1]["pnl"] += pnl
+                pos_size=0.0; pos_side=None; entry_price=np.nan; trail_ce=np.nan; cooldown=COOLDOWN_BARS
+
+        # Entradas
+        if pos_side is None and (long_sig or short_sig):
+            side = "long" if long_sig else "short"
+            ok_ai = True
+            if pattern_model is not None and USE_PATTERN_AI:
+                vec = build_pattern_vector(i, side, pattern_model["L"], df["close"], rs_series, adx)
+                if vec is not None:
+                    R = TP_ATR/SL_ATR
+                    p_min = 1.0/(1.0+R) + PAT_AI_PMIN_OFFSET
+                    d2 = ((pattern_model["centers"] - vec[None,:])**2).sum(axis=1)
+                    j = int(d2.argmin())
+                    if pattern_model["counts"][j] >= PAT_MIN_COUNT:
+                        p_win = float(pattern_model["wr"][j])
+                        ok_ai = (p_win >= p_min)
+            if ok_ai:
+                stop_dist = SL_ATR*atr_i
+                size = (cash * PERCENT_RISK_ATR)/max(stop_dist,1e-9)
+                base_px = c
+                notional_ideal = base_px*size
+                max_notional_lev = cash * LEVERAGE
+                dv_ema_i = float((df["close"]*df["volume"]).ewm(span=20, adjust=False, min_periods=1).mean().iloc[i])
+                max_notional_liq = LIQ_FRAC * max(dv_ema_i, 0.0)
+                max_notional = max(0.0, min(max_notional_lev, max_notional_liq))
+                if max_notional>0:
+                    notional_ideal = min(notional_ideal, max_notional)
+                size = max(0.0, notional_ideal / max(base_px,1e-9))
+                size = floor(size*1e4)/1e4 if size>0 else 0.0  # 4 decimales
+                if base_px*size >= MIN_NOTIONAL and size>0:
+                    fee_in = TAKER_FEE * abs(size*base_px)
+                    if side=="long":  cash -= size*base_px + fee_in
+                    else:             cash += size*base_px - fee_in
+                    pos_size=size; pos_side=side; entry_price=base_px
+                    trades.append({"side":side,"entry_t":ts,"entry":float(base_px),"size":float(size),"exit_t":None,"exit":None,"pnl":-fee_in})
+
+        equity = cash + (pos_size*c if pos_side=="long" else (-pos_size*c if pos_side=="short" else 0.0))
+        equity_curve.append((ts, equity))
+
+    # Cierre forzado si queda posición abierta
+    if pos_side in ("long","short") and pos_size>0:
+        last_ts = df.index[-1]; last_c = float(df["close"].iloc[-1])
+        fee = TAKER_FEE * abs(pos_size*last_c)
+        if pos_side=="long":  cash += pos_size*last_c - fee
+        else:                  cash -= pos_size*last_c + fee
+        trades.append({"side":pos_side,"entry_t":last_ts,"entry":float(entry_price),"size":float(pos_size),
+                       "exit_t":last_ts,"exit":last_c,"pnl": pos_size*((last_c - entry_price) if pos_side=="long" else (entry_price - last_c)) - fee})
+        equity_curve.append((last_ts, cash))
+
+    eq = pd.DataFrame(equity_curve, columns=["time","equity"]).set_index("time")
+    return eq, trades
+
+def compute_metrics(equity:pd.Series, trades, tf:str)->pd.DataFrame:
+    eq=equity.dropna()
+    start_eq = float(eq.iloc[0]); end_eq = float(eq.iloc[-1])
+    total_return = (end_eq/start_eq - 1.0) if start_eq>0 else np.nan
+    years=(eq.index[-1]-eq.index[0]).days/365.25 if len(eq)>1 else 0
+    cagr = (end_eq/start_eq)**(1/years) - 1 if (years>0 and start_eq>0 and end_eq>0) else np.nan
+    roll=eq.cummax(); dd=eq/roll-1.0; max_dd=dd.min()
+    rets=eq.pct_change().dropna(); freq = {"1m":525600, "5m":105120, "15m":35040, "30m":17520, "1h":8760, "4h":2190, "1d":365}.get(tf, 35040)
+    sharpe=np.sqrt(freq)*(rets.mean()/(rets.std()+1e-12)) if len(rets)>2 else np.nan
+    wins=[t for t in trades if (t["pnl"] or 0)>0]; losses=[t for t in trades if (t["pnl"] or 0)<=0]
+    win_rate = len(wins)/max(len(wins)+len(losses),1) if trades else np.nan
+    avg_win=np.mean([t["pnl"] for t in wins]) if wins else 0.0
+    avg_loss=np.mean([t["pnl"] for t in losses]) if losses else 0.0
+    pf=(sum([t["pnl"] for t in wins])/abs(sum([t["pnl"] for t in losses]))) if losses else np.nan
+    return pd.DataFrame({
+        "Initial Equity":[start_eq],
+        "Final Equity":[end_eq],
+        "Total Return %":[100*total_return if np.isfinite(total_return) else np.nan],
+        "CAGR %":[100*cagr if np.isfinite(cagr) else np.nan],
+        "Max Drawdown %":[100*max_dd],
+        "Sharpe (aprox)":[float(sharpe) if np.isfinite(sharpe) else np.nan],
+        "Trades":[len(trades)], "Win Rate %":[100*win_rate if np.isfinite(win_rate) else np.nan],
+        "Avg Win":[float(avg_win)], "Avg Loss":[float(avg_loss)], "Profit Factor":[float(pf) if np.isfinite(pf) else np.nan],
+    })
+
+# ---------- Walk-Forward (corregido: arrastra posición y cierra al final) ----------
+def _precompute_indics(df):
+    ceL, ceS, atr_raw = chandelier_exit(df["high"], df["low"], df["close"], CE_LENGTH, CE_MULT)
+    _ , _, adx = dmi_adx(df["high"], df["low"], df["close"], ADX_LENGTH)
+    ema_line = ema(df["close"], EMA_LENGTH) if USE_EMA_FILTER else pd.Series(np.nan, index=df.index)
+    rs_series = rsi(df["close"], 14)
+    dollar_vol_ema = (df["close"]*df["volume"]).ewm(span=20, adjust=False, min_periods=1).mean().fillna(0.0)
+    atr_eff = pd.Series(np.maximum(atr_raw.values, ATR_FLOOR_PCT * df["close"].values), index=df.index)
+    return ceL, ceS, adx, ema_line, rs_series, dollar_vol_ema, atr_raw, atr_eff
+
+def _run_chunk(df, i0, i1, model, pre, cash_start, pos_size_start, pos_side_start, entry_price_start):
+    ceL, ceS, adx, ema_line, rs_series, dollar_vol_ema, atr_raw, atr_eff = pre
+    cash = float(cash_start)
+    pos_size=float(pos_size_start); pos_side=pos_side_start; entry_price=float(entry_price_start) if np.isfinite(entry_price_start) else np.nan
+    trail_ce=np.nan
+    trades=[]; equity_curve=[]
+    cooldown=0
+
+    # Si traemos posición abierta, el equity inicial del bloque reflejará MTM
+    if i0 < len(df):
+        c0 = float(df["close"].iloc[i0])
+        eq0 = cash + (pos_size*c0 if pos_side=="long" else (-pos_size*c0 if pos_side=="short" else 0.0))
+        equity_curve.append((df.index[i0], eq0))
+
+    for i in range(max(i0,1), i1+1):
+        ts = df.index[i]
+        o,h,l,c = [float(df[col].iloc[i]) for col in ["open","high","low","close"]]
+        pc = float(df["close"].iloc[i-1])
+        ceL_now, ceS_now = float(ceL.iloc[i]), float(ceS.iloc[i])
+        ceL_prev, ceS_prev = float(ceL.iloc[i-1]), float(ceS.iloc[i-1])
+        adx_now = float(adx.iloc[i])
+        ema_ok_L = True if not USE_EMA_FILTER else (c > float(ema_line.iloc[i]))
+        ema_ok_S = True if not USE_EMA_FILTER else (c < float(ema_line.iloc[i]))
+        long_sig  = (pc <= ceS_prev) and (c > ceS_now) and (adx_now > ADX_THRESHOLD) and ema_ok_L
+        short_sig = (pc >= ceL_prev) and (c < ceL_now) and (adx_now > ADX_THRESHOLD) and ema_ok_S and ALLOW_SHORTS
+        if cooldown>0: long_sig=False; short_sig=False; cooldown-=1
+        atr_i = float(atr_eff.iloc[i])
+
+        # Trailing & niveles
+        if pos_side=="long" and pos_size>0:
+            trail_ce = ceL_now if not np.isfinite(trail_ce) else max(trail_ce, ceL_now)
+            stop_lvl = max(trail_ce, entry_price - SL_ATR*atr_i)
+            tp_lvl   = entry_price + TP_ATR*atr_i if TP_ATR>0 else None
+        elif pos_side=="short" and pos_size>0:
+            trail_ce = ceS_now if not np.isfinite(trail_ce) else min(trail_ce, ceS_now)
+            stop_lvl = min(trail_ce, entry_price + SL_ATR*atr_i)
+            tp_lvl   = entry_price - TP_ATR*atr_i if TP_ATR>0 else None
+        else:
+            stop_lvl=None; tp_lvl=None
+
+        # Salidas intrabar
+        if pos_side is not None and pos_size>0:
+            exit_px=None
+            if pos_side=="long":
+                if l <= stop_lvl: exit_px = stop_lvl*(1 - STOP_SLIP_BPS*1e-4)
+                elif tp_lvl is not None and h >= tp_lvl: exit_px = tp_lvl
+            else:
+                if h >= stop_lvl: exit_px = stop_lvl*(1 + STOP_SLIP_BPS*1e-4)
+                elif tp_lvl is not None and l <= tp_lvl: exit_px = tp_lvl
+
+            if exit_px is not None:
+                fee = TAKER_FEE * abs(pos_size*exit_px)
+                if pos_side=="long":  cash += pos_size*exit_px - fee
+                else:                  cash -= pos_size*exit_px + fee
+                # Asegura registro de trade
+                if len(trades)==0 or trades[-1].get("exit_t") is not None:
+                    trades.append({"side":pos_side,"entry_t":ts,"entry":float(entry_price),"size":float(pos_size),
+                                   "exit_t":ts,"exit":float(exit_px),"pnl":0.0})
+                trades[-1]["exit_t"]=ts; trades[-1]["exit"]=float(exit_px)
+                pnl = pos_size*((exit_px - entry_price) if pos_side=="long" else (entry_price - exit_px)) - fee
+                trades[-1]["pnl"] += pnl
+                pos_size=0.0; pos_side=None; entry_price=np.nan; trail_ce=np.nan; cooldown=COOLDOWN_BARS
+
+        # Entradas (modelo del chunk)
+        if pos_side is None and (long_sig or short_sig):
+            side = "long" if long_sig else "short"
+            ok_ai = True
+            if model is not None and USE_PATTERN_AI:
+                vec = build_pattern_vector(i, side, model["L"], df["close"], rsi(df["close"],14), adx)
+                if vec is not None:
+                    R = TP_ATR/SL_ATR
+                    p_min = 1.0/(1.0+R) + PAT_AI_PMIN_OFFSET
+                    d2 = ((model["centers"] - vec[None,:])**2).sum(axis=1)
+                    j = int(d2.argmin())
+                    if model["counts"][j] >= PAT_MIN_COUNT:
+                        p_win = float(model["wr"][j])
+                        ok_ai = (p_win >= p_min)
+            if ok_ai:
+                stop_dist = SL_ATR*atr_i
+                size = (cash * PERCENT_RISK_ATR)/max(stop_dist,1e-9)
+                base_px = c
+                notional_ideal = base_px*size
+                max_notional_lev = cash * LEVERAGE
+                dv_ema_i = float((df["close"]*df["volume"]).ewm(span=20, adjust=False, min_periods=1).mean().iloc[i])
+                max_notional_liq = LIQ_FRAC * max(dv_ema_i, 0.0)
+                max_notional = max(0.0, min(max_notional_lev, max_notional_liq))
+                if max_notional>0:
+                    notional_ideal = min(notional_ideal, max_notional)
+                size = max(0.0, notional_ideal / max(base_px,1e-9))
+                size = floor(size*1e4)/1e4 if size>0 else 0.0
+                if base_px*size >= MIN_NOTIONAL and size>0:
+                    fee_in = TAKER_FEE * abs(size*base_px)
+                    if side=="long":  cash -= size*base_px + fee_in
+                    else:             cash += size*base_px - fee_in
+                    pos_size=size; pos_side=side; entry_price=base_px
+                    trades.append({"side":side,"entry_t":ts,"entry":float(base_px),"size":float(size),
+                                   "exit_t":None,"exit":None,"pnl":-fee_in})
+
+        # Equity MTM
+        equity = cash + (pos_size*c if pos_side=="long" else (-pos_size*c if pos_side=="short" else 0.0))
+        equity_curve.append((ts, equity))
+
+        # Protección liquidación simplificada
+        if equity <= 0 and pos_side is not None and pos_size>0:
+            px_liq = c
+            fee = TAKER_FEE * abs(pos_size*px_liq)
+            if pos_side=="long":  cash += pos_size*px_liq - fee
+            else:                  cash -= pos_size*px_liq + fee
+            trades.append({"side":pos_side,"entry_t":ts,"entry":float(entry_price),"size":float(pos_size),
+                           "exit_t":ts,"exit":float(px_liq),"pnl": pos_size*((px_liq - entry_price) if pos_side=="long" else (entry_price - px_liq)) - fee})
+            pos_size=0.0; pos_side=None; entry_price=np.nan
+            equity = cash
+            equity_curve[-1]=(ts, equity)
+
+    eq = pd.DataFrame(equity_curve, columns=["time","equity"]).set_index("time")
+    return cash, pos_size, pos_side, entry_price, trades, eq
+
+def walkforward_backtest(df, lookback_days=180, retrain_every_bars=96):
+    pre = _precompute_indics(df)
+    cash = float(INITIAL_CASH)
+    pos_size=0.0; pos_side=None; entry_price=np.nan
+    all_trades=[]; all_eq=[]
+
+    i = 0
+    while i < len(df):
+        t_end = df.index[i]
+        t_start = t_end - pd.Timedelta(days=lookback_days)
+        mask = (df.index >= t_start) & (df.index < t_end)
+        df_train = df.loc[mask]
+
+        if len(df_train) < PAT_WIN_LEN + 100:
+            i += retrain_every_bars
+            continue
+
+        model = train_pattern_ai(
+            df_train,
+            pre[0].loc[df_train.index], pre[1].loc[df_train.index],  # ceL, ceS
+            pre[2].loc[df_train.index], rsi(df_train["close"],14),   # adx, rsi local
+            (ema(df_train["close"], EMA_LENGTH) if USE_EMA_FILTER else pd.Series(np.nan, index=df_train.index)),
+            pre[6].loc[df_train.index],                             # atr_raw
+            L=PAT_WIN_LEN, K=PAT_K, max_samples=PAT_MAX_TRAIN_SAMPLES,
+            adx_thr=ADX_THRESHOLD, use_ema=USE_EMA_FILTER, allow_shorts=ALLOW_SHORTS
+        ) if USE_PATTERN_AI else None
+
+        j0 = i; j1 = min(len(df)-1, i + retrain_every_bars - 1)
+
+        cash, pos_size, pos_side, entry_price, trades, eq = _run_chunk(
+            df, j0, j1, model, pre,
+            cash_start=cash,
+            pos_size_start=pos_size,
+            pos_side_start=pos_side,
+            entry_price_start=entry_price
+        )
+        all_trades.extend(trades); all_eq.append(eq)
+        i = j1 + 1
+
+    # Cierra la posición que quede abierta al final
+    if pos_side in ("long","short") and pos_size>0:
+        last_ts = df.index[-1]; last_c = float(df["close"].iloc[-1])
+        fee = TAKER_FEE * abs(pos_size*last_c)
+        if pos_side=="long":  cash += pos_size*last_c - fee
+        else:                  cash -= pos_size*last_c + fee
+        all_trades.append({"side":pos_side, "entry_t":last_ts, "entry":float(entry_price),
+                           "size":float(pos_size), "exit_t":last_ts, "exit":last_c,
+                           "pnl": pos_size*((last_c - entry_price) if pos_side=="long" else (entry_price - last_c)) - fee})
+        all_eq.append(pd.DataFrame({"equity":[cash]}, index=[last_ts]))
+
+    eq_all = pd.concat(all_eq).sort_index() if all_eq else pd.DataFrame([], columns=["equity"], index=df.index)
+    return eq_all, all_trades
+
+# ================== EJECUCIÓN ==================
+print(f"Descargando {SYMBOL} {TIMEFRAME}…")
+df = fetch_df(SYMBOL, TIMEFRAME, START, END)
+print(f"Rango: {df.index[0]} → {df.index[-1]} | velas={len(df)}")
+
+if RUN_BACKTEST:
+    eq, trades = backtest(df, use_pattern_ai=USE_PATTERN_AI)
+    met = compute_metrics(eq["equity"], trades, TIMEFRAME)
+    print("\n=== RESUMEN BACKTEST ===")
+    print(met.to_string(index=False))
+    eq.to_csv("bt_equity.csv")
+    pd.DataFrame(trades).to_csv("bt_trades.csv", index=False)
+    met.to_csv("bt_summary.csv", index=False)
+    print("\nGuardados: bt_summary.csv, bt_equity.csv, bt_trades.csv")
+
+    # Gráficos backtest
+    plt.figure(figsize=(10,4))
+    plt.plot(eq.index, eq["equity"].values)
+    plt.title(f"Equity (Backtest) • {SYMBOL} • {TIMEFRAME}")
+    plt.xlabel("Fecha (UTC)"); plt.ylabel("Equity")
+    plt.tight_layout(); plt.show()
+
+    roll = eq["equity"].cummax(); dd = eq["equity"]/roll - 1.0
+    plt.figure(figsize=(10,3))
+    plt.plot(dd.index, 100*dd.values)
+    plt.title("Drawdown % (Backtest)")
+    plt.xlabel("Fecha (UTC)"); plt.ylabel("DD %")
+    plt.tight_layout(); plt.show()
+
+if RUN_WALKFORWARD:
+    eq_wf, trades_wf = walkforward_backtest(df, lookback_days=LOOKBACK_DAYS, retrain_every_bars=RETRAIN_EVERY_BARS)
+    met_wf = compute_metrics(eq_wf["equity"], trades_wf, TIMEFRAME)
+    print("\n=== RESUMEN WALK-FORWARD ===")
+    print(met_wf.to_string(index=False))
+    eq_wf.to_csv("wf_equity.csv")
+    pd.DataFrame(trades_wf).to_csv("wf_trades.csv", index=False)
+    met_wf.to_csv("wf_summary.csv", index=False)
+    print("\nGuardados: wf_summary.csv, wf_equity.csv, wf_trades.csv")
+
+    # Gráfico WF
+    plt.figure(figsize=(10,4))
+    plt.plot(eq_wf.index, eq_wf["equity"].values)
+    plt.title(f"Equity (Walk-forward) • {SYMBOL} • {TIMEFRAME}")
+    plt.xlabel("Fecha (UTC)"); plt.ylabel("Equity")
+    plt.tight_layout(); plt.show()
