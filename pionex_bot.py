@@ -476,6 +476,13 @@ def load_model():
     }
 
 
+# //TODO: revisar manejo de errores y logging
+# // Escribir una funciona de log que escriba en un archivo journalcrl.log
+# // y que incluya timestamps en cada entrada.
+# // Agregar los print en el autoentrenador y en el main loop por llamadas a esta función de log.
+# // Asegurarse de que los errores también se registren en el archivo de log.
+
+
 def autotrain():
     global pattern_model, _last_trained_bar
     print(
@@ -487,6 +494,11 @@ def autotrain():
             df = fetch_df(CFG["SYMBOL"], CFG["TIMEFRAME"], bars=bars)
             if df.empty:
                 time.sleep(CFG["AUTO_INTERVAL_MINUTES"] * 60)
+
+                ## Log no data fetched for training
+                with open("journalcrl.log", "a", encoding="utf-8") as f:
+                    f.write(f"[{utcnow()}] [AUTO] No data fetched for training\n")
+
                 continue
             ceL, ceS, atr_raw = chandelier_exit(
                 df["high"], df["low"], df["close"], CFG["CE_LENGTH"], CFG["CE_MULT"]
