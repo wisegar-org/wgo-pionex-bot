@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/pionex-bot
-EnvironmentFile=/home/ubuntu/pionex-bot/.env
-ExecStart=/home/ubuntu/pionex-bot/.venv/bin/python /home/ubuntu/pionex-bot/bot.py
+User=root
+WorkingDirectory=/opt/pionex-bot/pionex-bot
+EnvironmentFile=/opt/pionex-bot/pionex-bot/.env
+ExecStart=//opt/pionex-bot/pionex-bot/.venv/bin/python /opt/pionex-bot/pionex-bot/pionex-bot.py
 Restart=always
 RestartSec=5
 
